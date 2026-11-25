@@ -1,0 +1,33 @@
+CuktechMac10Ultra
+Copyright (c) 2026 a1287448852 (https://github.com/a1287448852/CuktechMac10Ultra)
+Licensed under the MIT License (see LICENSE).
+
+--------------------------------------------------------------------------------
+致谢与上游项目声明 (Acknowledgments & Attribution)
+--------------------------------------------------------------------------------
+
+1. Blank2007/cuktech-ultra-tray (MIT License)
+   https://github.com/Blank2007/cuktech-ultra-tray
+   Copyright (c) 2026 Blank2007 & CuktechTray contributors
+
+   本项目的 MIoT BLE 加密认证状态机、MiOT TLV 编解码、小米云扫码登录客户端以及基础的
+   Swift 协议实现均基于 Blank2007/cuktech-ultra-tray 衍生并针对 macOS 做深度性能优化与
+   Liquid Glass 界面重构。特此向原作者 Blank2007 及贡献者致谢。
+
+2. kairui1108/cuktech-ble-ha & kairui1108/cuktech-ble-esp32 (MIT License)
+   https://github.com/kairui1108/cuktech-ble-ha
+   https://github.com/kairui1108/cuktech-ble-esp32
+
+   最早完成酷态科 10 号 Ultra 小米 BLE 协议逆向与开源文档化的项目，为上游实现提供了关键基础。
+
+3. apple/swift-crypto (Apache License 2.0)
+   https://github.com/apple/swift-crypto
+   用于跨平台密码学原语（AES / HKDF / HMAC）。
+
+--------------------------------------------------------------------------------
+商标声明 (Trademarks)
+--------------------------------------------------------------------------------
+
+「CUKTECH」「酷态科」「小米」「米家」「Mi Home」「Apple」「macOS」「Liquid Glass」
+均分别为其各自权利人的商标。本项目为第三方开源社区工具，与酷态科、小米或苹果公司无任何
+官方关联或背书关系。

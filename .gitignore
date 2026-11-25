@@ -1,0 +1,23 @@
+# SwiftPM / Xcode
+.build/
+.swiftpm/
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+
+# Build & Release artifacts
+dist/
+*.app/
+*.dmg
+*.zip
+*.iconset/
+
+# Local runtime secrets / logs
+config.json
+settings.json
+session.json
+tray.log
+tray.log.*
+
+# macOS
+.DS_Store
