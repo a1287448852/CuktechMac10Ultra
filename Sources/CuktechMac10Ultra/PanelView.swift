@@ -258,17 +258,14 @@ struct PanelView: View {
                 .foregroundStyle(wattColor)
                 .frame(minWidth: 52, alignment: .trailing)
 
-            VStack(spacing: 3) {
-                compactPortToggle(label: "C3", isOn: Binding(
-                    get: { c3On },
-                    set: { model.setPort(snap.ports[2].zeroBasedIndex, $0) }
-                ))
-                compactPortToggle(label: "A", isOn: Binding(
-                    get: { aOn },
-                    set: { model.setPort(snap.ports[3].zeroBasedIndex, $0) }
-                ))
+            VStack(spacing: 4) {
+                compactPortToggle(label: "C3", isOn: c3On, disabled: !snap.connected) {
+                    model.setPort(snap.ports[2].zeroBasedIndex, !c3On)
+                }
+                compactPortToggle(label: "A", isOn: aOn, disabled: !snap.connected) {
+                    model.setPort(snap.ports[3].zeroBasedIndex, !aOn)
+                }
             }
-            .disabled(!snap.connected)
         }
         .padding(.horizontal, 11)
         .padding(.vertical, 7)
@@ -278,16 +275,13 @@ struct PanelView: View {
         )
     }
 
-    private func compactPortToggle(label: String, isOn: Binding<Bool>) -> some View {
-        HStack(spacing: 4) {
+    private func compactPortToggle(label: String, isOn: Bool, disabled: Bool, action: @escaping () -> Void) -> some View {
+        HStack(spacing: 5) {
             Text(label)
                 .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .frame(width: 14, alignment: .trailing)
-            Toggle("", isOn: isOn)
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.mini)
+            GlassPortSwitch(isOn: isOn, disabled: disabled, action: action)
         }
     }
 
@@ -322,16 +316,9 @@ struct PanelView: View {
                 .foregroundStyle(wattColor)
                 .frame(minWidth: 56, alignment: .trailing)
 
-            Toggle("", isOn: Binding(
-                get: { isEnabled },
-                set: { newValue in
-                    model.setPort(slot.zeroBasedIndex, newValue)
-                }
-            ))
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .controlSize(.mini)
-            .disabled(!snap.connected)
+            GlassPortSwitch(isOn: isEnabled, disabled: !snap.connected) {
+                model.setPort(slot.zeroBasedIndex, !isEnabled)
+            }
         }
         .padding(.horizontal, 11)
         .padding(.vertical, 8)
@@ -455,6 +442,33 @@ struct PanelView: View {
             .contentShape(Capsule())
             .liquidGlassCapsule(interactive: true)
         }
+    }
+}
+
+/// 单次点击驱动的胶囊开关，彻底避免 SwiftUI Toggle + NSSwitch 双向绑定引起的重入回弹。
+private struct GlassPortSwitch: View {
+    let isOn: Bool
+    let disabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            ZStack(alignment: isOn ? .trailing : .leading) {
+                Capsule()
+                    .fill(isOn ? Theme.ok : Color.primary.opacity(0.18))
+                    .frame(width: 30, height: 17)
+                Circle()
+                    .fill(Color.white)
+                    .shadow(color: Color.black.opacity(0.18), radius: 1.5, y: 0.5)
+                    .frame(width: 13, height: 13)
+                    .padding(2)
+            }
+            .animation(.snappy(duration: 0.18), value: isOn)
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.45 : 1.0)
     }
 }
 

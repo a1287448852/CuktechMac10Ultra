@@ -28,7 +28,8 @@ final class TrayController: NSObject {
     private var lastRenderedTitleKey = ""
     private var sceneSyncTask: Task<Void, Never>?
     private var desiredSceneMode: Int?
-    private var portRequestTokens: [Int: UUID] = [:]
+    private var portSyncTasks: [Int: Task<Void, Never>] = [:]
+    private var desiredPortStates: [Int: Bool] = [:]
 
     init(settings: AppSettings) {
         self.settings = settings
@@ -402,22 +403,30 @@ final class TrayController: NSObject {
             panel.model.optimisticPorts.removeValue(forKey: zeroBasedIndex)
             return
         }
-        let token = UUID()
-        portRequestTokens[zeroBasedIndex] = token
-        log.write("[panel] 设置端口 \(zeroBasedIndex) -> \(on ? "通电" : "断电")")
-        Task { @MainActor in
-            do {
-                try await s.setPortEnabled(zeroBasedIndex, on)
-                self.log.write("[panel] 设置端口 \(zeroBasedIndex) 成功")
-            } catch {
-                let msg = "端口控制失败：\(error)"
-                self.log.write("[panel] \(msg)")
-                self.panel.model.showFeedback(msg)
+        desiredPortStates[zeroBasedIndex] = on
+        if portSyncTasks[zeroBasedIndex] != nil {
+            log.write("[panel] 快速连击端口 \(zeroBasedIndex) 合并目标 -> \(on ? "通电" : "断电")")
+            return
+        }
+
+        portSyncTasks[zeroBasedIndex] = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while let targetOn = self.desiredPortStates.removeValue(forKey: zeroBasedIndex) {
+                let started = Date()
+                self.log.write("[panel] 设置端口 \(zeroBasedIndex) -> \(targetOn ? "通电" : "断电")")
+                do {
+                    try await s.setPortEnabled(zeroBasedIndex, targetOn)
+                    let ms = Int(Date().timeIntervalSince(started) * 1000)
+                    self.log.write("[panel] 设置端口 \(zeroBasedIndex) 成功 (\(ms)ms)")
+                } catch {
+                    let msg = "端口控制失败：\(error)"
+                    self.log.write("[panel] \(msg)")
+                    self.panel.model.showFeedback(msg)
+                    break
+                }
             }
-            if self.portRequestTokens[zeroBasedIndex] == token {
-                self.portRequestTokens.removeValue(forKey: zeroBasedIndex)
-                self.panel.model.optimisticPorts.removeValue(forKey: zeroBasedIndex)
-            }
+            self.portSyncTasks.removeValue(forKey: zeroBasedIndex)
+            self.panel.model.optimisticPorts.removeValue(forKey: zeroBasedIndex)
         }
     }
 

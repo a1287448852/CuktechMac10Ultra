@@ -272,8 +272,17 @@ public actor DeviceSession {
             guard try await s.sendCommand(siid: 2, piid: 16, value: next, timeout: 6) != nil else {
                 throw MibleError.timeout("写入端口开关没有收到确认")
             }
-            guard let backMsg = try await s.sendCommand(siid: 2, piid: 16, timeout: 4),
-                  let back = backMsg.uintValue else {
+            // 硬件切换物理 MOSFET 开关需要约 150~250ms 稳定时间，过早 GET 会读到切换前旧值
+            try? await Task.sleep(nanoseconds: 250_000_000)
+
+            var backMsg = try await s.sendCommand(siid: 2, piid: 16, timeout: 4)
+            if let v = backMsg?.uintValue, v != next {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                if let retryMsg = try await s.sendCommand(siid: 2, piid: 16, timeout: 4) {
+                    backMsg = retryMsg
+                }
+            }
+            guard let back = backMsg?.uintValue else {
                 throw MibleError.timeout("已写入，但回读失败，实际状态未知")
             }
 
@@ -304,7 +313,14 @@ public actor DeviceSession {
             guard try await s.sendCommand(siid: 2, piid: 5, value: UInt32(mode), timeout: 6) != nil else {
                 throw MibleError.timeout("写入充电模式没有收到确认")
             }
-            if let m = try await s.sendCommand(siid: 2, piid: 5, timeout: 4), let first = m.valueBytes.first {
+            var m = try await s.sendCommand(siid: 2, piid: 5, timeout: 4)
+            if let first = m?.valueBytes.first, Int(first) != mode {
+                try? await Task.sleep(nanoseconds: 200_000_000)
+                if let retry = try await s.sendCommand(siid: 2, piid: 5, timeout: 4) {
+                    m = retry
+                }
+            }
+            if let first = m?.valueBytes.first {
                 var snap = snapshot
                 snap.sceneMode = Int(first)
                 emit(snap)
