@@ -10,11 +10,19 @@ final class PanelModel: ObservableObject {
     @Published var optimisticPorts: [Int: Bool] = [:]
     @Published var pinned = false
     @Published var feedback: String?
+    @Published var capturingPort: Int?
+    @Published var captureStats: CaptureAccumulator?
+    @Published var pollInterval: Double = 1.0
 
     var onReconnect: (() -> Void)?
     var onSetPort: ((Int, Bool) -> Void)?
     var onSetScene: ((Int) -> Void)?
     var onTogglePin: (() -> Void)?
+    var onStartCapture: ((Int) -> Void)?
+    var onStopCapture: (() -> Void)?
+    var onOpenSettings: (() -> Void)?
+    var onChangePollInterval: ((Double) -> Void)?
+    var onOpenAbout: (() -> Void)?
     var onQuit: (() -> Void)?
 
     var effectiveSceneMode: Int {
@@ -62,6 +70,9 @@ final class PanelModel: ObservableObject {
         s.ports[1].apply(PortData(state: 0x01, code: 0x05, current: 1.50, voltage: 9.0))
         s.ports[2].apply(PortData(state: 0x11, code: 0x01, current: 2.00, voltage: 5.0))
         s.ports[3].apply(PortData(state: 0x00, code: 0x00, current: 0.0, voltage: 0.0))
+        s.negotiations[0] = Negotiation(code: 8, watts: 65)
+        s.negotiations[1] = Negotiation(code: 7, watts: 30)
+        s.negotiations[2] = Negotiation(code: 7, watts: 20)
         snapshot = s
     }
 }
@@ -77,6 +88,9 @@ struct PanelView: View {
             header
             heroTotalCard
             portsSection
+            if let port = model.capturingPort {
+                captureBanner(port: port)
+            }
             sceneSection
             if let feedback = model.feedback {
                 Text(feedback)
@@ -244,6 +258,12 @@ struct PanelView: View {
                         .padding(.horizontal, 5)
                         .padding(.vertical, 1)
                         .background(Capsule().fill(Color.primary.opacity(0.08)))
+                    if c3On, let neg = snap.negotiations[2], !neg.isEmpty {
+                        protocolBadge(neg, prefix: "C3")
+                    }
+                    if aOn, let neg = snap.negotiations[3], !neg.isEmpty {
+                        protocolBadge(neg, prefix: "A")
+                    }
                 }
                 Text(anyOn ? merged.detail : "已断电")
                     .font(.system(size: 11, design: .monospaced))
@@ -300,9 +320,14 @@ struct PanelView: View {
                 .frame(width: 3.5, height: 30)
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(slot.name)
-                    .font(.system(size: 11.5, weight: .medium))
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 5) {
+                    Text(slot.name)
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    if isEnabled, let neg = snap.negotiations[slot.zeroBasedIndex], !neg.isEmpty {
+                        protocolBadge(neg)
+                    }
+                }
                 Text(isEnabled ? slot.detail : "已断电")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundStyle(isEnabled ? .primary : .secondary)
@@ -408,39 +433,178 @@ struct PanelView: View {
         .disabled(!snap.connected)
     }
 
+    // MARK: - 协议标签与采集状态条
+
+    private func protocolBadge(_ neg: Negotiation, prefix: String? = nil) -> some View {
+        let label = prefix.map { "\($0) \(neg.text)" } ?? neg.text
+        return Text(label)
+            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            .foregroundStyle(Theme.accent)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(Capsule().fill(Theme.accent.opacity(0.14)))
+    }
+
+    @ViewBuilder
+    private func captureBanner(port: Int) -> some View {
+        let stats = model.captureStats ?? CaptureAccumulator()
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Theme.ok)
+                .frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("正在采集 \(PortData.portName(port))")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.primary)
+                Text(String(format: "%.2f Wh · %.1fW · %d 次", stats.energyWh, stats.lastPower, stats.sampleCount))
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+            Button {
+                model.onStopCapture?()
+            } label: {
+                Text("停止")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(.primary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .contentShape(Capsule())
+            .liquidGlassCapsule(tint: Theme.bad.opacity(0.24), interactive: true)
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 8)
+        .liquidGlassSurface(cornerRadius: 12, tint: Theme.ok.opacity(0.14))
+    }
+
     // MARK: - 底栏
 
     private var footer: some View {
-        HStack(spacing: 10) {
-            Button {
-                model.reconnect()
-            } label: {
-                Label("重新连接", systemImage: "arrow.clockwise")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 10)
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                Menu {
+                    if model.capturingPort != nil {
+                        Button("停止当前采集") {
+                            model.onStopCapture?()
+                        }
+                    } else {
+                        ForEach(0..<4, id: \.self) { idx in
+                            Button("采集 \(PortData.portName(idx))") {
+                                model.onStartCapture?(idx)
+                            }
+                        }
+                    }
+                } label: {
+                    Label(
+                        model.capturingPort == nil ? "单口采集" : "正在采集",
+                        systemImage: model.capturingPort == nil ? "waveform.path.ecg" : "stop.circle.fill"
+                    )
+                    .font(.system(size: 10.5, weight: .medium))
+                    .foregroundStyle(model.capturingPort == nil ? .secondary : Theme.ok)
+                    .padding(.horizontal, 9)
                     .padding(.vertical, 5)
                     .contentShape(Capsule())
-            }
-            .buttonStyle(.plain)
-            .contentShape(Capsule())
-            .liquidGlassCapsule(interactive: true)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .disabled(!snap.connected)
+                .liquidGlassCapsule(
+                    tint: model.capturingPort == nil ? nil : Theme.ok.opacity(0.18),
+                    interactive: true
+                )
 
-            Spacer()
+                Menu {
+                    ForEach([1, 2, 3, 5, 10], id: \.self) { sec in
+                        Button {
+                            model.onChangePollInterval?(Double(sec))
+                        } label: {
+                            if Int(model.pollInterval.rounded()) == sec {
+                                Label("\(sec) 秒", systemImage: "checkmark")
+                            } else {
+                                Text("\(sec) 秒")
+                            }
+                        }
+                    }
+                } label: {
+                    Label("\(Int(model.pollInterval.rounded()))s", systemImage: "timer")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .contentShape(Capsule())
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .liquidGlassCapsule(interactive: true)
+                .help("设置面板打开时的读数刷新间隔")
 
-            Button {
-                model.onQuit?()
-            } label: {
-                Text("退出")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .contentShape(Capsule())
+                Button {
+                    model.onOpenSettings?()
+                } label: {
+                    Label("设置", systemImage: "gearshape")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .contentShape(Capsule())
+                .disabled(!snap.connected)
+                .opacity(snap.connected ? 1 : 0.5)
+                .liquidGlassCapsule(interactive: true)
+
+                Spacer(minLength: 0)
+
+                Button {
+                    model.onOpenAbout?()
+                } label: {
+                    Image(systemName: "info.circle")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 26, height: 24)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .contentShape(Capsule())
+                .liquidGlassCapsule(interactive: true)
+                .help("关于与检查更新")
             }
-            .buttonStyle(.plain)
-            .contentShape(Capsule())
-            .liquidGlassCapsule(interactive: true)
+
+            HStack(spacing: 10) {
+                Button {
+                    model.reconnect()
+                } label: {
+                    Label("重新连接", systemImage: "arrow.clockwise")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .contentShape(Capsule())
+                .liquidGlassCapsule(interactive: true)
+
+                Spacer()
+
+                Button {
+                    model.onQuit?()
+                } label: {
+                    Text("退出")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .contentShape(Capsule())
+                .liquidGlassCapsule(interactive: true)
+            }
         }
     }
 }

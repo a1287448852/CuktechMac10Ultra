@@ -23,7 +23,11 @@ final class TrayController: NSObject {
     private var wattsItem: NSMenuItem!
     private var fixedWidthItem: NSMenuItem!
     private var launchAtLoginItem: NSMenuItem!
+    private var settingsMenuItem: NSMenuItem!
+    private var stopCaptureItem: NSMenuItem!
     private var sceneItems: [Int: NSMenuItem] = [:]
+    private var capturePortItems: [Int: NSMenuItem] = [:]
+    private var pollIntervalItems: [Int: NSMenuItem] = [:]
 
     private var lastRenderedTitleKey = ""
     private var sceneSyncTask: Task<Void, Never>?
@@ -39,9 +43,11 @@ final class TrayController: NSObject {
         )
         super.init()
         panel.model.pinned = settings.pinPanel
+        panel.model.pollInterval = settings.activePollInterval
         buildMenu()
         wireStatusItemButton()
         wirePanel()
+        wireSettings()
         updateTitle(force: true)
     }
 
@@ -104,6 +110,7 @@ final class TrayController: NSObject {
         let changed = !snap.hasSameDisplayState(as: snapshot)
         snapshot = snap
         panel.model.snapshot = snap
+        SettingsController.shared.model.connected = snap.connected
         if changed {
             updateTitle()
             refreshMenuState()
@@ -212,6 +219,15 @@ final class TrayController: NSObject {
             mi.state = (snapshot.connected && snapshot.sceneMode == mode) ? .on : .off
             mi.isEnabled = snapshot.connected
         }
+        settingsMenuItem.isEnabled = snapshot.connected
+        for (idx, mi) in capturePortItems {
+            mi.state = (panel.model.capturingPort == idx) ? .on : .off
+            mi.isEnabled = snapshot.connected && panel.model.capturingPort == nil
+        }
+        stopCaptureItem.isEnabled = (panel.model.capturingPort != nil)
+        for (sec, mi) in pollIntervalItems {
+            mi.state = (Int(settings.activePollInterval.rounded()) == sec) ? .on : .off
+        }
         pinItem.state = settings.pinPanel ? .on : .off
         launchAtLoginItem.state = (SMAppService.mainApp.status == .enabled) ? .on : .off
     }
@@ -245,6 +261,40 @@ final class TrayController: NSObject {
         modeRoot.submenu = modeMenu
         menu.addItem(modeRoot)
 
+        settingsMenuItem = item("设备设置…", #selector(openSettings))
+        settingsMenuItem.isEnabled = false
+        menu.addItem(settingsMenuItem)
+
+        let captureMenu = NSMenu()
+        for idx in 0..<4 {
+            let mi = NSMenuItem(title: "采集 \(PortData.portName(idx))", action: #selector(startCaptureFromMenu(_:)), keyEquivalent: "")
+            mi.tag = idx
+            mi.target = self
+            mi.isEnabled = false
+            captureMenu.addItem(mi)
+            capturePortItems[idx] = mi
+        }
+        captureMenu.addItem(.separator())
+        stopCaptureItem = item("停止采集", #selector(stopCaptureFromMenu))
+        stopCaptureItem.isEnabled = false
+        captureMenu.addItem(stopCaptureItem)
+        let captureRoot = NSMenuItem(title: "单口采集 (Wh)", action: nil, keyEquivalent: "")
+        captureRoot.submenu = captureMenu
+        menu.addItem(captureRoot)
+
+        let pollMenu = NSMenu()
+        for sec in [1, 2, 3, 5, 10] {
+            let mi = NSMenuItem(title: "\(sec) 秒", action: #selector(selectPollInterval(_:)), keyEquivalent: "")
+            mi.tag = sec
+            mi.target = self
+            mi.state = (Int(settings.activePollInterval.rounded()) == sec) ? .on : .off
+            pollMenu.addItem(mi)
+            pollIntervalItems[sec] = mi
+        }
+        let pollRoot = NSMenuItem(title: "读数间隔", action: nil, keyEquivalent: "")
+        pollRoot.submenu = pollMenu
+        menu.addItem(pollRoot)
+
         menu.addItem(.separator())
         menu.addItem(item("重新连接", #selector(reconnect)))
         menu.addItem(item("重新配对…", #selector(runWizard)))
@@ -265,6 +315,7 @@ final class TrayController: NSObject {
         menu.addItem(.separator())
         menu.addItem(item("打开日志", #selector(openLog)))
         menu.addItem(item("显示配置文件", #selector(showConfig)))
+        menu.addItem(item("关于与检查更新…", #selector(openAbout)))
         menu.addItem(.separator())
         menu.addItem(item("退出", #selector(quit)))
     }
@@ -384,7 +435,74 @@ final class TrayController: NSObject {
         NSApp.terminate(nil)
     }
 
-    // MARK: - 面板回调
+    @objc private func openSettings() {
+        SettingsController.shared.show(connected: snapshot.connected)
+    }
+
+    @objc private func openAbout() {
+        AboutController.shared.show(firmware: snapshot.connected ? snapshot.firmware : nil)
+    }
+
+    @objc private func startCaptureFromMenu(_ sender: NSMenuItem) {
+        startCapture(port: sender.tag)
+    }
+
+    @objc private func stopCaptureFromMenu() {
+        stopCapture()
+    }
+
+    @objc private func selectPollInterval(_ sender: NSMenuItem) {
+        changePollInterval(Double(sender.tag))
+    }
+
+    private func startCapture(port: Int) {
+        guard let s = session, snapshot.connected else { return }
+        panel.model.capturingPort = port
+        panel.model.captureStats = CaptureAccumulator()
+        refreshMenuState()
+        Task { [weak self] in
+            await s.startCapture(
+                port: port,
+                onUpdate: { [weak self] acc in
+                    Task { @MainActor [weak self] in
+                        self?.panel.model.captureStats = acc
+                    }
+                },
+                onFinish: { [weak self] result in
+                    Task { @MainActor [weak self] in
+                        self?.finishCapture(result)
+                    }
+                }
+            )
+        }
+    }
+
+    private func stopCapture() {
+        guard let s = session else { return }
+        Task { await s.stopCapture() }
+    }
+
+    private func finishCapture(_ result: CaptureResult) {
+        panel.model.capturingPort = nil
+        panel.model.captureStats = nil
+        refreshMenuState()
+        CaptureResultController.shared.show(result: result)
+    }
+
+    private func changePollInterval(_ seconds: Double) {
+        let clamped = max(1.0, seconds)
+        settings.activePollInterval = clamped
+        settings.backgroundPollInterval = max(2.5, clamped)
+        panel.model.pollInterval = clamped
+        try? settings.save()
+        if let s = session {
+            let bg = settings.backgroundPollInterval
+            Task { await s.setPollIntervals(active: clamped, background: bg) }
+        }
+        refreshMenuState()
+    }
+
+    // MARK: - 面板与设置回调
 
     private func wirePanel() {
         panel.onVisibilityChanged = { [weak self] visible in
@@ -396,6 +514,47 @@ final class TrayController: NSObject {
         panel.model.onQuit = { NSApp.terminate(nil) }
         panel.model.onSetPort = { [weak self] zeroBasedIndex, on in self?.setPort(zeroBasedIndex, on) }
         panel.model.onSetScene = { [weak self] mode in self?.setScene(mode) }
+        panel.model.onStartCapture = { [weak self] port in self?.startCapture(port: port) }
+        panel.model.onStopCapture = { [weak self] in self?.stopCapture() }
+        panel.model.onOpenSettings = { [weak self] in self?.openSettings() }
+        panel.model.onChangePollInterval = { [weak self] sec in self?.changePollInterval(sec) }
+        panel.model.onOpenAbout = { [weak self] in self?.openAbout() }
+    }
+
+    private func wireSettings() {
+        let sm = SettingsController.shared.model
+        sm.onReload = { [weak self] in
+            guard let s = self?.session else { return DeviceSettings() }
+            return await s.reloadSettings()
+        }
+        sm.onSetScreenTimeout = { [weak self] v in
+            guard let s = self?.session else { throw SessionActionError.notConnected }
+            try await s.setScreenTimeout(v)
+        }
+        sm.onSetIdleScreenOff = { [weak self] on in
+            guard let s = self?.session else { throw SessionActionError.notConnected }
+            try await s.setIdleScreenOff(on)
+        }
+        sm.onSetScreenLock = { [weak self] on in
+            guard let s = self?.session else { throw SessionActionError.notConnected }
+            try await s.setScreenLock(on)
+        }
+        sm.onSetLanguage = { [weak self] v in
+            guard let s = self?.session else { throw SessionActionError.notConnected }
+            try await s.setLanguage(v)
+        }
+        sm.onSetUSBLowCurrent = { [weak self] on in
+            guard let s = self?.session else { throw SessionActionError.notConnected }
+            try await s.setUSBLowCurrent(on)
+        }
+        sm.onSetProtocol = { [weak self] cap, port, on in
+            guard let s = self?.session else { throw SessionActionError.notConnected }
+            try await s.setProtocol(cap, port: port, on: on)
+        }
+        sm.onSetCountdown = { [weak self] port, min in
+            guard let s = self?.session else { throw SessionActionError.notConnected }
+            try await s.setCountdown(port: port, minutes: min)
+        }
     }
 
     private func setPort(_ zeroBasedIndex: Int, _ on: Bool) {
@@ -465,5 +624,13 @@ final class TrayController: NSObject {
             self.panel.model.syncingScene = false
             self.panel.model.optimisticSceneMode = nil
         }
+    }
+}
+
+private enum SessionActionError: LocalizedError {
+    case notConnected
+
+    var errorDescription: String? {
+        "设备尚未连接"
     }
 }

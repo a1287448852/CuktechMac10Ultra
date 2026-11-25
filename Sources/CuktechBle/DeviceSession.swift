@@ -2,15 +2,17 @@
 import Foundation
 import CuktechCore
 
-/// 设备会话管理：把「扫广播 → 连接 → 认证 → 自适应轮询」串起来。
-/// 通过 AsyncStream 主动推送快照，UI 层无需再定时轮询。
+/// 设备会话管理：事件驱动 BLE 链路、自适应轮询、设备设置读写与单口电量采集。
+/// 通过 AsyncStream 主动推送快照，UI 层无需定时轮询。
 public actor DeviceSession {
     public private(set) var snapshot = DeviceSnapshot()
+    public private(set) var deviceSettings = DeviceSettings()
+    public private(set) var capturePort: Int?
 
     private let mac: [UInt8]
     private let token: [UInt8]
 
-    /// 面板打开时使用高频轮询；面板收起时使用低频后台轮询以节省蓝牙与电量。
+    /// 面板打开时使用高频轮询（默认 1.0s，可由用户设置 1/2/3/5/10s）；收起时降频到 2.5s+ 省电。
     private var activePollInterval: TimeInterval = 1.0
     private var backgroundPollInterval: TimeInterval = 2.5
     private var isPanelOpen = false
@@ -20,10 +22,11 @@ public actor DeviceSession {
     private var running = false
     private var failures = 0
     private var loopTask: Task<Void, Never>?
+    private var captureTask: Task<Void, Never>?
     private var sleepWakeContinuation: (token: UUID, cont: CheckedContinuation<Void, Never>)?
     private var pollCycleCount = 0
 
-    /// 串行化高层控制事务（读-改-写开关、切换模式、单轮刷新），并支持用户操作优先插队。
+    /// 串行化高层控制事务（读-改-写开关、切换模式、设置读写、单轮刷新），支持用户操作优先插队。
     private var transactionBusy = false
     private var urgentControlCount = 0
     private var urgentWaiters: [CheckedContinuation<Void, Never>] = []
@@ -45,7 +48,7 @@ public actor DeviceSession {
 
     public func setPollIntervals(active: TimeInterval, background: TimeInterval) {
         activePollInterval = max(0.5, active)
-        backgroundPollInterval = max(1.0, background)
+        backgroundPollInterval = max(activePollInterval, background)
         wakePollSleep()
     }
 
@@ -90,6 +93,9 @@ public actor DeviceSession {
 
     public func stop() {
         running = false
+        captureTask?.cancel()
+        captureTask = nil
+        capturePort = nil
         wakePollSleep()
         loopTask?.cancel()
         loopTask = nil
@@ -115,10 +121,12 @@ public actor DeviceSession {
                 failures = 0
                 while running && !Task.isCancelled {
                     guard let l = link, l.isConnected else { break }
-                    pollCycleCount += 1
-                    // 打开面板时每 5 轮补读一次充电模式，其余时间只读端口减少蓝牙通道抢占
-                    let shouldQueryScene = isPanelOpen && (pollCycleCount % 5 == 0)
-                    try await refreshOnce(includeScene: shouldQueryScene)
+                    // 单口采集期间常规轮询让路，避免同一通道并发拥挤
+                    if capturePort == nil {
+                        pollCycleCount += 1
+                        let includeMeta = isPanelOpen && (pollCycleCount % 5 == 0)
+                        try await refreshOnce(includeMeta: includeMeta)
+                    }
                     let interval = isPanelOpen ? activePollInterval : backgroundPollInterval
                     await sleepInterruptibly(seconds: interval)
                 }
@@ -129,7 +137,6 @@ public actor DeviceSession {
                     await sleepInterruptibly(seconds: 0.8)
                 }
             } catch {
-                // 关键修复：异常退出前必须立即断开旧连接，否则充电器被旧连接占住会停止发送 FE95 广播
                 teardownLink()
                 if !running || Task.isCancelled { break }
                 failures += 1
@@ -188,7 +195,7 @@ public actor DeviceSession {
         snap.firmware = firmware
         emit(snap)
 
-        try await refreshOnce(includeScene: true)
+        try await refreshOnce(includeMeta: true)
     }
 
     private func handleLinkLog(_ source: CBMibleLink?, _ msg: String) {
@@ -202,7 +209,7 @@ public actor DeviceSession {
         wakePollSleep()
     }
 
-    private func refreshOnce(includeScene: Bool) async throws {
+    private func refreshOnce(includeMeta: Bool) async throws {
         guard mible?.authenticated == true else { throw MibleError.notAuthenticated }
 
         var snap = snapshot
@@ -219,7 +226,7 @@ public actor DeviceSession {
         }
 
         if urgentControlCount > 0 { return }
-        if includeScene || snap.sceneMode == 0 {
+        if includeMeta || snap.sceneMode == 0 {
             if let m = try await withTransactionLock(urgent: false, {
                 guard let s = mible, s.authenticated else { throw MibleError.notAuthenticated }
                 return try await s.sendCommand(siid: 2, piid: 5, timeout: 4)
@@ -242,15 +249,35 @@ public actor DeviceSession {
             }
             snap.ports[i] = slot
         }
+
+        if includeMeta && urgentControlCount == 0 {
+            if let m = try? await withTransactionLock(urgent: false, {
+                guard let s = mible, s.authenticated else { throw MibleError.notAuthenticated }
+                return try await s.sendCommand(siid: 2, piid: 17, timeout: 2.5)
+            }), let v = m.uintValue {
+                let p = Negotiation.split(v)
+                snap.negotiations[0] = p.high
+                snap.negotiations[1] = p.low
+            }
+            if urgentControlCount == 0, let m = try? await withTransactionLock(urgent: false, {
+                guard let s = mible, s.authenticated else { throw MibleError.notAuthenticated }
+                return try await s.sendCommand(siid: 2, piid: 18, timeout: 2.5)
+            }), let v = m.uintValue {
+                let p = Negotiation.split(v)
+                snap.negotiations[2] = p.high
+                snap.negotiations[3] = p.low
+            }
+        }
+
         snap.at = Date()
 
         if answered == 0 { throw MibleError.timeout("四个端口都没有应答") }
         emit(snap)
     }
 
-    // MARK: - 控制
+    // MARK: - 端口与模式控制
 
-    /// zeroBasedIndex: 0=C1 1=C2 2=C3 3=USB-A。读-改-写，回读校验。
+    /// zeroBasedIndex: 0=C1 1=C2 2=C3 3=USB-A。读-改-写，带 250ms 硬件稳定期与回读重试。
     public func setPortEnabled(_ zeroBasedIndex: Int, _ enabled: Bool) async throws {
         guard zeroBasedIndex >= 0 && zeroBasedIndex < 4 else {
             throw MibleError.auth("端口序号只能是 0~3")
@@ -272,7 +299,6 @@ public actor DeviceSession {
             guard try await s.sendCommand(siid: 2, piid: 16, value: next, timeout: 6) != nil else {
                 throw MibleError.timeout("写入端口开关没有收到确认")
             }
-            // 硬件切换物理 MOSFET 开关需要约 150~250ms 稳定时间，过早 GET 会读到切换前旧值
             try? await Task.sleep(nanoseconds: 250_000_000)
 
             var backMsg = try await s.sendCommand(siid: 2, piid: 16, timeout: 4)
@@ -300,7 +326,7 @@ public actor DeviceSession {
         wakePollSleep()
     }
 
-    /// 切换充电模式（SIID=2 PIID=5，取值 1~4）。写入并回读确认后立刻返回，不再阻塞等待 6 路端口刷新。
+    /// 切换充电模式（SIID=2 PIID=5，取值 1~4）。
     public func setSceneMode(_ mode: Int) async throws {
         guard mode >= 1 && mode <= 4 else { throw MibleError.auth("充电模式只有 1~4") }
 
@@ -329,6 +355,262 @@ public actor DeviceSession {
                 }
             }
         }
+    }
+
+    // MARK: - 设备设置（屏幕 / 供电 / 定时 / 快充协议）
+
+    public func reloadSettings() async -> DeviceSettings {
+        guard mible?.authenticated == true else { return deviceSettings }
+
+        urgentControlCount += 1
+        defer { urgentControlCount -= 1 }
+
+        let loaded: DeviceSettings? = try? await withTransactionLock(urgent: true) {
+            var out = DeviceSettings()
+
+            func get(_ piid: UInt16) async -> UInt32? {
+                guard let s = mible, s.authenticated else { return nil }
+                let m = try? await s.sendCommand(siid: 2, piid: piid, timeout: 3)
+                guard let m, m.errorCode == 0, let v = m.uintValue else { return nil }
+                return v
+            }
+
+            if let v = await get(6) { out.screenTimeout = Int(v) }
+            if let v = await get(19) { out.idleScreenOff = v != 0 }
+            if let v = await get(20) { out.screenLock = v != 0 }
+            if let v = await get(15) { out.usbALowCurrent = v != 0 }
+            if let v = await get(13) { out.language = Int(v) }
+            if let v = await get(21) { out.protocolFlags = v }
+            for i in 0..<4 {
+                if let v = await get(UInt16(9 + i)) { out.countdowns[i] = Int(v) }
+            }
+            if let v = await get(17) {
+                let p = Negotiation.split(v)
+                out.negotiations[0] = p.high
+                out.negotiations[1] = p.low
+            }
+            if let v = await get(18) {
+                let p = Negotiation.split(v)
+                out.negotiations[2] = p.high
+                out.negotiations[3] = p.low
+            }
+            out.at = Date()
+            return out
+        }
+        guard let out = loaded else { return deviceSettings }
+
+        log("[settings] 读到 \(out.loadedCount) 项：息屏=\(optText(out.screenTimeout)) "
+            + "空闲息屏=\(optText(out.idleScreenOff)) 方向锁=\(optText(out.screenLock)) "
+            + "A小电流=\(optText(out.usbALowCurrent)) 语言=\(optText(out.language)) "
+            + "协议位=\(out.protocolFlags.map { String(format: "0x%08X", $0) } ?? "?") "
+            + "倒计时=\(out.countdowns.map { optText($0) }.joined(separator: "/"))")
+
+        deviceSettings = out
+        var snap = snapshot
+        snap.negotiations = out.negotiations
+        emit(snap)
+        return out
+    }
+
+    private func optText<T>(_ v: T?) -> String { v.map { "\($0)" } ?? "?" }
+
+    public func setScreenTimeout(_ value: Int) async throws {
+        guard ScreenTimeout(rawValue: value) != nil else {
+            throw MibleError.auth("息屏时间只有 1~5 这几个取值")
+        }
+        try await writeSetting(piid: 6, value: UInt32(value), name: "息屏时间", strict: true)
+        deviceSettings.screenTimeout = value
+    }
+
+    public func setIdleScreenOff(_ on: Bool) async throws {
+        try await writeSetting(piid: 19, value: on ? 1 : 0, name: "空闲息屏", strict: true)
+        deviceSettings.idleScreenOff = on
+    }
+
+    public func setScreenLock(_ on: Bool) async throws {
+        try await writeSetting(piid: 20, value: on ? 1 : 0, name: "方向锁", strict: true)
+        deviceSettings.screenLock = on
+    }
+
+    public func setUSBLowCurrent(_ on: Bool) async throws {
+        try await writeSetting(piid: 15, value: on ? 1 : 0, name: "USB-A 小电流", strict: true)
+        deviceSettings.usbALowCurrent = on
+    }
+
+    public func setLanguage(_ value: Int) async throws {
+        guard value == 0 || value == 1 else { throw MibleError.auth("语言只有 0=EN / 1=中文") }
+        try await writeSetting(piid: 13, value: UInt32(value), name: "语言", strict: true)
+        deviceSettings.language = value
+    }
+
+    /// 开关某一口的某一种快充协议。PIID 21 是 32 位掩码，必须读-改-写。
+    public func setProtocol(_ cap: ProtocolCap, port: Int, on: Bool) async throws {
+        guard let bit = cap.bit(port: port) else {
+            throw MibleError.auth("\(PortData.portName(port)) 没有 \(cap.label) 这一项")
+        }
+        urgentControlCount += 1
+        defer { urgentControlCount -= 1 }
+
+        try await withTransactionLock(urgent: true) {
+            guard let s = mible, s.authenticated else { throw MibleError.notAuthenticated }
+
+            guard let curMsg = try await s.sendCommand(siid: 2, piid: 21, timeout: 4),
+                  curMsg.errorCode == 0, let cur = curMsg.uintValue else {
+                throw MibleError.timeout("读取协议开关失败（设备无响应），为了不误改其它协议，本次没有写入")
+            }
+            let mask = UInt32(1) << bit
+            let next = on ? (cur | mask) : (cur & ~mask)
+
+            guard try await s.sendCommand(siid: 2, piid: 21, value: next, timeout: 6) != nil else {
+                throw MibleError.timeout("写入协议开关没有收到确认")
+            }
+            var backMsg = try await s.sendCommand(siid: 2, piid: 21, timeout: 4)
+            if let v = backMsg?.uintValue, v != next {
+                try? await Task.sleep(nanoseconds: 180_000_000)
+                if let retry = try await s.sendCommand(siid: 2, piid: 21, timeout: 4) {
+                    backMsg = retry
+                }
+            }
+            guard let back = backMsg?.uintValue else {
+                throw MibleError.timeout("已写入，但回读失败，实际状态未知")
+            }
+            deviceSettings.protocolFlags = back
+            log(String(format: "[settings] 协议 %@ %@ -> 请求 0x%08X，回读 0x%08X",
+                       PortData.portName(port), cap.label, next, back))
+            if back != next {
+                throw MibleError.auth(String(format: "设备只接受了 0x%08X（请求 0x%08X），可能这一项不支持", back, next))
+            }
+        }
+    }
+
+    public func setCountdown(port: Int, minutes: Int) async throws {
+        guard (1...4).contains(port) else { throw MibleError.auth("端口序号只能是 1~4") }
+        guard (0...1440).contains(minutes) else { throw MibleError.auth("倒计时只能是 0~1440 分钟") }
+        try await writeSetting(piid: UInt16(8 + port), value: UInt32(minutes),
+                               name: "\(PortData.portName(port)) 定时断电", strict: false)
+        deviceSettings.countdowns[port - 1] = minutes
+    }
+
+    private func writeSetting(piid: UInt16, value: UInt32, name: String, strict: Bool) async throws {
+        urgentControlCount += 1
+        defer { urgentControlCount -= 1 }
+
+        try await withTransactionLock(urgent: true) {
+            guard let s = mible, s.authenticated else { throw MibleError.notAuthenticated }
+
+            guard try await s.sendCommand(siid: 2, piid: piid, value: value, timeout: 6) != nil else {
+                throw MibleError.timeout("写入「\(name)」没有收到确认")
+            }
+            guard let backMsg = try await s.sendCommand(siid: 2, piid: piid, timeout: 4),
+                  let back = backMsg.uintValue else {
+                throw MibleError.timeout("「\(name)」已写入，但回读失败，实际状态未知")
+            }
+            log("[settings] \(name) 写 \(value)，回读 \(back)")
+            if strict && back != value {
+                throw MibleError.auth("「\(name)」设备只接受了 \(back)（请求 \(value)），可能这一项不支持")
+            }
+        }
+    }
+
+    // MARK: - 单口电量采集
+
+    /// 按绝对 1 秒节拍采样指定端口（1..4），结果只留在内存中不落盘。
+    public func startCapture(port: Int,
+                             onUpdate: @escaping @Sendable (CaptureAccumulator) -> Void,
+                             onFinish: @escaping @Sendable (CaptureResult) -> Void) {
+        guard captureTask == nil, (1...4).contains(port) else { return }
+        guard mible?.authenticated == true else { return }
+        capturePort = port
+        log("[capture] 开始采集 \(PortData.portName(port))，每秒一次")
+        captureTask = Task { [weak self] in
+            await self?.runCapture(port: port, onUpdate: onUpdate, onFinish: onFinish)
+        }
+    }
+
+    public func stopCapture() {
+        guard captureTask != nil else { return }
+        log("[capture] 手动停止")
+        captureTask?.cancel()
+    }
+
+    private func runCapture(port: Int,
+                            onUpdate: @Sendable (CaptureAccumulator) -> Void,
+                            onFinish: @Sendable (CaptureResult) -> Void) async {
+        let started = Date()
+        var acc = CaptureAccumulator()
+        var lastGood = started
+        var lastActive = started
+        var reason: CaptureEndReason = .noData
+        var nextTick = started
+
+        while !Task.isCancelled {
+            if Date().timeIntervalSince(lastGood) >= 30 {
+                reason = .noData
+                break
+            }
+            if Date().timeIntervalSince(lastActive) >= 30 {
+                reason = .noLoad
+                break
+            }
+            guard let l = link, l.isConnected, let s = mible, s.authenticated else {
+                reason = .disconnected
+                break
+            }
+
+            var msg: MiotMessage?
+            do {
+                msg = try await withTransactionLock(urgent: false) {
+                    try await s.sendCommand(siid: 2, piid: UInt16(port), timeout: 2.0)
+                }
+            } catch {
+                msg = nil
+            }
+
+            if let d = PortData.parse(msg?.valueBytes) {
+                let now = Date()
+                acc.add(d, at: now)
+                lastGood = now
+                if d.state != 0x00 && d.power > 0.05 { lastActive = now }
+
+                var snap = snapshot
+                var slot = snap.ports[port - 1]
+                slot.apply(d)
+                slot.enabled = (snap.portSwitch & (1 << (port - 1))) != 0
+                snap.ports[port - 1] = slot
+                snap.at = now
+                emit(snap)
+                onUpdate(acc)
+            }
+
+            nextTick = nextTick.addingTimeInterval(1.0)
+            if nextTick.timeIntervalSinceNow < 0 {
+                nextTick = Date()
+            }
+            var remaining = nextTick.timeIntervalSinceNow
+            while remaining > 0 {
+                if Task.isCancelled { break }
+                try? await Task.sleep(nanoseconds: UInt64(min(0.1, remaining) * 1_000_000_000))
+                remaining = nextTick.timeIntervalSinceNow
+            }
+        }
+
+        if Task.isCancelled { reason = .stopped }
+        captureTask = nil
+        capturePort = nil
+        wakePollSleep()
+
+        let result = CaptureResult(
+            portIndex: port,
+            startedAt: started,
+            endedAt: Date(),
+            stats: acc,
+            reason: reason,
+            firmware: snapshot.firmware
+        )
+        log("[capture] 结束 \(PortData.portName(port))：\(acc.sampleCount) 次采样，"
+            + String(format: "%.2fWh，平均 %.1fW，", acc.energyWh, acc.averagePower)
+            + reason.shortText)
+        onFinish(result)
     }
 
     // MARK: - 内部

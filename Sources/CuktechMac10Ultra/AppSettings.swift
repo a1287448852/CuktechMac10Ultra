@@ -11,8 +11,26 @@ public struct AppSettings: Codable, Sendable {
     public var showWattsInMenuBar: Bool = true
     public var fixedMenuBarWidth: Bool = true
     public var pinPanel: Bool = false
+    public var privacyAccepted: Bool = false
 
     public init() {}
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        mac = try c.decodeIfPresent(String.self, forKey: .mac) ?? ""
+        tokenHex = try c.decodeIfPresent(String.self, forKey: .tokenHex) ?? ""
+        activePollInterval = max(0.5, try c.decodeIfPresent(Double.self, forKey: .activePollInterval) ?? 1.0)
+        backgroundPollInterval = max(activePollInterval, try c.decodeIfPresent(Double.self, forKey: .backgroundPollInterval) ?? 2.5)
+        showWattsInMenuBar = try c.decodeIfPresent(Bool.self, forKey: .showWattsInMenuBar) ?? true
+        fixedMenuBarWidth = try c.decodeIfPresent(Bool.self, forKey: .fixedMenuBarWidth) ?? true
+        pinPanel = try c.decodeIfPresent(Bool.self, forKey: .pinPanel) ?? false
+        if let accepted = try c.decodeIfPresent(Bool.self, forKey: .privacyAccepted) {
+            privacyAccepted = accepted
+        } else {
+            // 老配置若已配对过设备，默认视为已同意以免打断升级体验
+            privacyAccepted = !mac.isEmpty && !tokenHex.isEmpty
+        }
+    }
 
     public static var directory: URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -48,6 +66,7 @@ public struct AppSettings: Codable, Sendable {
                 migrated.tokenHex = legacy.tokenHex ?? ""
                 migrated.activePollInterval = max(0.5, legacy.pollInterval ?? 1.0)
                 migrated.showWattsInMenuBar = legacy.showWattsInMenuBar ?? true
+                migrated.privacyAccepted = !migrated.mac.isEmpty && !migrated.tokenHex.isEmpty
                 try? migrated.save()
                 return migrated
             }

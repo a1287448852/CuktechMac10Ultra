@@ -135,6 +135,7 @@ public struct DeviceSnapshot: Equatable, Sendable {
     public var portSwitch = 0
     public var sceneMode = 0
     public var ports: [PortSlot] = (1...4).map { PortSlot(index: $0) }
+    public var negotiations: [Negotiation?] = [nil, nil, nil, nil]
     public var at = Date()
 
     public init() {}
@@ -224,5 +225,6 @@ public struct DeviceSnapshot: Equatable, Sendable {
             && portSwitch == other.portSwitch
             && sceneMode == other.sceneMode
             && ports == other.ports
+            && negotiations == other.negotiations
     }
 }

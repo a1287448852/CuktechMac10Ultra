@@ -450,10 +450,10 @@ public final class MibleSession: @unchecked Sendable {
             guard let msg = try await decodeInline(data) else { continue }
 
             if msg.siid == siid && msg.piid == UInt8(piid & 0xFF) {
-                // 实测设备对 SET 只返回 op=0x01 ACK（不含新值），不再空等 1 秒，由上层显式 GET 回读
-                if msg.isGetResult || msg.isSetAck {
-                    return msg
-                }
+                // GET 只认 op=0x03 结果、SET 只认 op=0x01 ACK（ACK 不含新值，由调用方显式 GET 回读）；
+                // 两者都立即返回不空等 1s，同时防止延迟到达的 SET ACK 误截断紧随其后的 GET 回读。
+                if msg.isGetResult { return msg }
+                if isSet && msg.isSetAck { return msg }
             }
             if msg.isPush { onPush?(msg) }
         }

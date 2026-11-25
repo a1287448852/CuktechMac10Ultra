@@ -178,4 +178,17 @@ final class MibleSessionTests: XCTestCase {
         XCTAssertEqual(ack?.isSetAck, true)
         XCTAssertLessThan(elapsed, 0.3)
     }
+
+    func testGetIgnoresStaleSetAckAndWaitsForGetResult() async throws {
+        let link = FakeDeviceLink(token: token)
+        let session = try MibleSession(link: link, token: token)
+        link.session = session
+
+        try await session.authenticate()
+        // 先跑一次 SET，再跑一次 GET，验证 GET 只认 op=0x03 且返回完整端口读数
+        _ = try await session.sendCommand(siid: 2, piid: 1, value: 1, timeout: 2.0)
+        let getMsg = try await session.sendCommand(siid: 2, piid: 1, timeout: 2.0)
+        XCTAssertEqual(getMsg?.isGetResult, true)
+        XCTAssertEqual(getMsg?.valueBytes.count, 4)
+    }
 }

@@ -43,7 +43,15 @@ MainActor.assumeIsolated {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
 
-    let controller = TrayController(settings: AppSettings.load())
+    let isDemo = args.contains(where: { $0 == "--wizard-demo" || $0.hasPrefix("--wizard-demo=") || $0 == "--panel-demo" })
+    var settings = AppSettings.load()
+    if !isDemo {
+        guard PrivacyGate.ensureAccepted(settings: &settings) else {
+            exit(0)
+        }
+    }
+
+    let controller = TrayController(settings: settings)
     let delegate = AppDelegate(controller: controller)
 
     if let demoArg = args.first(where: { $0 == "--wizard-demo" || $0.hasPrefix("--wizard-demo=") }) {
