@@ -60,8 +60,8 @@ final class PanelModel: ObservableObject {
         s.sceneMode = 1
         s.ports[0].apply(PortData(state: 0x01, code: 0x0A, current: 3.18, voltage: 20.0))
         s.ports[1].apply(PortData(state: 0x01, code: 0x05, current: 1.50, voltage: 9.0))
-        s.ports[2].apply(PortData(state: 0x00, code: 0x00, current: 0.0, voltage: 0.0))
-        s.ports[3].apply(PortData(state: 0x01, code: 0x01, current: 1.00, voltage: 5.0))
+        s.ports[2].apply(PortData(state: 0x11, code: 0x01, current: 2.00, voltage: 5.0))
+        s.ports[3].apply(PortData(state: 0x00, code: 0x00, current: 0.0, voltage: 0.0))
         snapshot = s
     }
 }
@@ -113,7 +113,7 @@ struct PanelView: View {
                             .background(Capsule().fill(Color.primary.opacity(0.08)))
                     }
                 }
-                Text(snap.connected ? "\(snap.activePortCount)/4 接口输出中" : (snap.error ?? snap.status))
+                Text(snap.connected ? "\(snap.activePortCount)/3 路通道输出中" : (snap.error ?? snap.status))
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -207,13 +207,87 @@ struct PanelView: View {
         )
     }
 
-    // MARK: - 四路端口读数与开关
+    // MARK: - 端口读数与开关（C1 / C2 / 合并 C3+A）
 
     private var portsSection: some View {
         VStack(spacing: 6) {
-            ForEach(0..<4, id: \.self) { i in
-                portRow(slot: snap.ports[i])
+            portRow(slot: snap.ports[0])
+            portRow(slot: snap.ports[1])
+            mergedC3ARow(merged: snap.mergedC3A)
+        }
+    }
+
+    private func mergedC3ARow(merged: MergedC3ASlot) -> some View {
+        let c3On = model.effectivePortEnabled(snap.ports[2])
+        let aOn = model.effectivePortEnabled(snap.ports[3])
+        let anyOn = c3On || aOn
+        let barColor = Theme.color(
+            anyOn
+                ? (merged.watts > 0.05 ? WattStyle.port(merged.watts) : WattStyle.ok)
+                : WattStyle.dim
+        )
+        let wattColor = Theme.color(anyOn ? WattStyle.port(merged.watts) : WattStyle.dim)
+
+        return HStack(spacing: 10) {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(barColor)
+                .frame(width: 3.5, height: 34)
+
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    Text("C3 / A")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text("合并")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Capsule().fill(Color.primary.opacity(0.08)))
+                }
+                Text(anyOn ? merged.detail : "已断电")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(anyOn ? .primary : .secondary)
             }
+
+            Spacer(minLength: 0)
+
+            Text(anyOn ? WattStyle.text(merged.watts) : "断电")
+                .font(.system(size: 15, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+                .foregroundStyle(wattColor)
+                .frame(minWidth: 52, alignment: .trailing)
+
+            VStack(spacing: 3) {
+                compactPortToggle(label: "C3", isOn: Binding(
+                    get: { c3On },
+                    set: { model.setPort(snap.ports[2].zeroBasedIndex, $0) }
+                ))
+                compactPortToggle(label: "A", isOn: Binding(
+                    get: { aOn },
+                    set: { model.setPort(snap.ports[3].zeroBasedIndex, $0) }
+                ))
+            }
+            .disabled(!snap.connected)
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Color.primary.opacity(0.045))
+        )
+    }
+
+    private func compactPortToggle(label: String, isOn: Binding<Bool>) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .frame(width: 14, alignment: .trailing)
+            Toggle("", isOn: isOn)
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
         }
     }
 

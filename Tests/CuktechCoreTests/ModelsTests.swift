@@ -50,4 +50,28 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(SceneMode.name(3), "单口")
         XCTAssertEqual(SceneMode.name(9), "模式 9")
     }
+
+    func testMergedC3APowerAvoidsIdleFalseBlankAndDoubleCount() {
+        var snap = DeviceSnapshot()
+        snap.connected = true
+        snap.ports[2].apply(PortData(state: 0x11, code: 0x05, current: 2.0, voltage: 9.0))
+        snap.ports[3].apply(PortData(state: 0x00, code: 0x00, current: 0.0, voltage: 0.0))
+
+        XCTAssertEqual(snap.mergedC3A.watts, 18.0, accuracy: 0.001)
+        XCTAssertFalse(snap.mergedC3A.idle)
+        XCTAssertEqual(snap.mergedC3A.detail, "9.0V · 2.00A")
+        XCTAssertEqual(snap.totalWatts, 18.0, accuracy: 0.001)
+        XCTAssertEqual(snap.activePortCount, 1)
+
+        // 若固件在 C3 和 A 两个 PIID 上同时上报同一个 0x11 合并通道，总功率不翻倍
+        snap.ports[3].apply(PortData(state: 0x11, code: 0x05, current: 2.0, voltage: 9.0))
+        XCTAssertEqual(snap.mergedC3A.watts, 18.0, accuracy: 0.001)
+        XCTAssertEqual(snap.totalWatts, 18.0, accuracy: 0.001)
+
+        // 两路均断电时显示已断电
+        snap.ports[2].enabled = false
+        snap.ports[3].enabled = false
+        XCTAssertEqual(snap.mergedC3A.detail, "已断电")
+        XCTAssertEqual(snap.mergedC3A.watts, 0.0, accuracy: 0.001)
+    }
 }

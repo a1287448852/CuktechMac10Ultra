@@ -113,6 +113,19 @@ public struct PortSlot: Equatable, Sendable {
     }
 }
 
+/// C3 与 USB-A 共用硬件检测通道（0x11），对外合并为一个通道展示，避免单口空载误导与双计。
+public struct MergedC3ASlot: Equatable, Sendable {
+    public let c3Enabled: Bool
+    public let aEnabled: Bool
+    public let hasData: Bool
+    public let idle: Bool
+    public let watts: Double
+    public let detail: String
+
+    public var anyEnabled: Bool { c3Enabled || aEnabled }
+    public var isActive: Bool { anyEnabled && hasData && !idle && watts > 0.05 }
+}
+
 /// 一次轮询拿到的完整状态。界面只读这个结构。
 public struct DeviceSnapshot: Equatable, Sendable {
     public var connected = false
@@ -126,11 +139,72 @@ public struct DeviceSnapshot: Equatable, Sendable {
 
     public init() {}
 
-    public var totalWatts: Double { ports.reduce(0) { $0 + $1.watts } }
+    /// 酷态科 10 号 Ultra 的 C3 与 A 口共享硬件功率检测通道（state=0x11）。
+    public var mergedC3A: MergedC3ASlot {
+        let c3 = ports[2]
+        let a = ports[3]
+        let anyEnabled = c3.enabled || a.enabled
+        guard anyEnabled else {
+            return MergedC3ASlot(c3Enabled: false, aEnabled: false, hasData: c3.hasData || a.hasData,
+                                 idle: true, watts: 0, detail: "已断电")
+        }
+
+        let candidates = [c3, a].filter { $0.enabled && $0.hasData }
+        guard !candidates.isEmpty else {
+            return MergedC3ASlot(c3Enabled: c3.enabled, aEnabled: a.enabled, hasData: false,
+                                 idle: true, watts: 0, detail: "无应答")
+        }
+
+        let active = candidates.filter { !$0.idle && ($0.watts > 0.05 || $0.current > 0.05) }
+        if active.isEmpty {
+            // 若仅有残留待机电压（如 5.1V · 0.00A）而无实际负载电流，统一归入空载显示更清爽
+            let prefix = (c3.enabled && a.enabled) ? "" : (c3.enabled ? "仅 C3 通电 · " : "仅 A 通电 · ")
+            return MergedC3ASlot(c3Enabled: c3.enabled, aEnabled: a.enabled, hasData: true,
+                                 idle: true, watts: 0, detail: prefix + "空载")
+        }
+
+        let totalW: Double
+        let detailText: String
+        if active.count == 2 {
+            let first = active[0]
+            let second = active[1]
+            let sameMergedChannel = first.state == 0x11 || second.state == 0x11
+                || (abs(first.voltage - second.voltage) < 0.05 && abs(first.current - second.current) < 0.05)
+            if sameMergedChannel {
+                let primary = first.watts >= second.watts ? first : second
+                totalW = primary.watts
+                detailText = String(format: "%.1fV · %.2fA", primary.voltage, primary.current)
+            } else {
+                totalW = ((first.watts + second.watts) * 10).rounded(.toNearestOrEven) / 10
+                detailText = String(format: "%.1fV · %.2fA", first.voltage, first.current + second.current)
+            }
+        } else {
+            let primary = active[0]
+            totalW = primary.watts
+            detailText = String(format: "%.1fV · %.2fA", primary.voltage, primary.current)
+        }
+
+        let prefix = (c3.enabled && a.enabled) ? "" : (c3.enabled ? "仅 C3 · " : "仅 A · ")
+        return MergedC3ASlot(c3Enabled: c3.enabled, aEnabled: a.enabled, hasData: true,
+                             idle: false, watts: totalW, detail: prefix + detailText)
+    }
+
+    public var totalWatts: Double {
+        let sum = ports[0].watts + ports[1].watts + mergedC3A.watts
+        return (sum * 10).rounded(.toNearestOrEven) / 10
+    }
+
     public var totalText: String { WattStyle.text(totalWatts) }
     public var totalColor: RGB { WattStyle.total(totalWatts) }
     public var sceneName: String { SceneMode.name(sceneMode) }
-    public var activePortCount: Int { ports.filter { $0.enabled && $0.hasData && !$0.idle && $0.watts > 0.05 }.count }
+
+    public var activePortCount: Int {
+        var count = 0
+        if ports[0].enabled && ports[0].hasData && !ports[0].idle && ports[0].watts > 0.05 { count += 1 }
+        if ports[1].enabled && ports[1].hasData && !ports[1].idle && ports[1].watts > 0.05 { count += 1 }
+        if mergedC3A.isActive { count += 1 }
+        return count
+    }
 
     /// 状态行：已连接 · 固件版本 · 总输出 6.0W
     public var headline: String {
